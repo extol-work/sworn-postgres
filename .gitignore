@@ -1,0 +1,12 @@
+# Internal working docs, not published
+INTERNAL_ROADMAP.md
+
+# Rust
+/target
+Cargo.lock
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

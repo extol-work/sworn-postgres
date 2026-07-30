@@ -1,6 +1,6 @@
 # sworn-postgres
 
-Reference implementation of [SWORN v0.1](https://github.com/extol-work/sworn). Postgres + Ed25519. No blockchain required.
+Reference implementation of [SWORN](https://github.com/extol-work/sworn). Postgres + Ed25519. No blockchain required.
 
 ## Status
 
@@ -16,21 +16,21 @@ Deliberately minimal:
 - **Signing:** Ed25519. Standard library, no crypto novelty.
 - **Notarization:** SHA256 hashes of attestation records stored in a Postgres table, with append-only semantics enforced by the schema. No blockchain.
 - **API:** HTTP + OpenAPI. Curl-friendly. No client SDK required to attest or verify.
-- **Interface:** CLI (`sworn`) wrapping the API. Seven lines to a first verified attestation.
+- **Interface:** CLI (`sworn`) wrapping the API. Five lines to a first verified attestation.
 
 ## What this is not
 
-- Production infrastructure for a paid product (that's Extol's job)
+- Production infrastructure for a paid product
 - The only conforming implementation (that's the point of the spec)
-- A demonstration of blockchain notarization (that's [Appendix A of the spec](https://github.com/extol-work/sworn/blob/main/SPEC.md#appendix-a) — Extol's SAS-based binding)
+- A demonstration of blockchain notarization (see the SWORN spec appendix on Solana / SAS binding, once that appendix drafts)
 
 ## Quickstart (once implementation lands)
 
 ```bash
 # Coming soon:
-docker compose up
-sworn keygen > mykey.pem
-sworn attest --key mykey.pem --subject "sha256:abcdef..." --payload '{"kind":"endorsement"}'
+docker compose up -d
+sworn keygen > my.key
+sworn attest --key my.key --subject sha256:abcdef... --payload hello.json
 sworn verify latest.sworn.json
 ```
 
@@ -38,12 +38,12 @@ sworn verify latest.sworn.json
 
 Four packages, one substrate:
 
-- `api/` — HTTP server implementing the SWORN Layer 5 endpoints
-- `cli/` — command-line wrapper on top of the API (this is the primary developer surface)
-- `store/` — Postgres schema + queries for attestation records and Merkle batches
-- `verify/` — pure verification logic (no DB, no HTTP — safe to embed elsewhere)
+- `api/`: HTTP server implementing the SWORN Layer 5 endpoints
+- `cli/`: command-line wrapper on top of the API (primary developer surface)
+- `store/`: Postgres schema and queries for attestation records
+- `verify/`: pure verification logic (no DB, no HTTP), safe to embed elsewhere
 
-Language TBD (see [SCOPE.md §Language](./SCOPE.md#language)).
+Written in Rust. The `verify/` package is designed to be embeddable via FFI or WASM so other implementations can share the same verifier.
 
 ## License
 
@@ -52,5 +52,4 @@ Apache 2.0.
 ## See also
 
 - [SWORN specification](https://github.com/extol-work/sworn)
-- [SCOPE.md](./SCOPE.md) — what's in v0.1, what's not, why
-- [ROADMAP.md](./ROADMAP.md) — target dates and dependency chain
+- [SCOPE.md](./SCOPE.md): what's in v0.1, what's not, why
