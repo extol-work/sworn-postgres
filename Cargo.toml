@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "verify",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/extol-work/sworn-postgres"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Signing / hashing primitives. Kept minimal on purpose: verify/ is meant to be
+# embeddable elsewhere (Titania's browser UI via WASM, third-party bindings).
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
+rand_core = { version = "0.6", features = ["std"] }
+sha2 = "0.10"
+thiserror = "1"

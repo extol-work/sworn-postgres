@@ -1,0 +1,18 @@
+[package]
+name = "sworn-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure Ed25519 signature verification for SWORN attestations. No DB, no HTTP, safe to embed."
+
+[lib]
+name = "sworn_verify"
+path = "src/lib.rs"
+
+[dependencies]
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

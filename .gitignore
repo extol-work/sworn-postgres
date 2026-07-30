@@ -3,7 +3,8 @@ INTERNAL_ROADMAP.md
 
 # Rust
 /target
-Cargo.lock
+# Cargo.lock is intentionally NOT ignored: this workspace ships binaries
+# (CLI, API server), so we want reproducible builds. Standard Rust guidance.
 
 # Editor
 .DS_Store
