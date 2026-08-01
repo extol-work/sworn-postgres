@@ -9,7 +9,7 @@
 //! Scope for v0.1:
 //!
 //! - Ed25519 keygen (RFC 8032, PureEdDSA)
-//! - `canonical_bytes` construction (spec §3.1, 216 bytes)
+//! - `canonical_bytes` construction (spec §3.1, 208 bytes)
 //! - Sign and verify against `canonical_bytes`
 //! - SHA-256 helper for `data_hash` / `activity_hash` (spec §2.4)
 //!
@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 /// Length of the canonical byte sequence signed under Ed25519, per spec §3.1.
 ///
 /// Layout arithmetic: 32 (signer) + 32 (subject) + 32 (activity_hash) +
-/// 32 (data_hash) + 32 (witness_for) + 8 (created_at) + 8 (retention_hint) +
+/// 32 (data_hash) + 32 (witness_for) + 8 (signer_asserted_at) + 8 (retention_hint) +
 /// 32 (nonce) = **208 bytes**.
 ///
 /// The SPEC.md prose at the time of this crate's initial commit said "216
@@ -64,13 +64,13 @@ pub struct AttestationFields {
     pub activity_hash: Bytes32,
     pub data_hash: Bytes32,
     pub witness_for: Bytes32,
-    pub created_at: i64,
+    pub signer_asserted_at: i64,
     pub retention_hint: i64,
     pub nonce: Bytes32,
 }
 
 impl AttestationFields {
-    /// Construct the 216-byte canonical byte sequence per spec §3.1.
+    /// Construct the 208-byte canonical byte sequence per spec §3.1.
     ///
     /// Field order and widths are normative. Implementations MUST NOT include
     /// additional fields, framing, or version markers.
@@ -83,7 +83,7 @@ impl AttestationFields {
         write32(&mut out, &mut off, &self.activity_hash);
         write32(&mut out, &mut off, &self.data_hash);
         write32(&mut out, &mut off, &self.witness_for);
-        out[off..off + 8].copy_from_slice(&self.created_at.to_le_bytes());
+        out[off..off + 8].copy_from_slice(&self.signer_asserted_at.to_le_bytes());
         off += 8;
         out[off..off + 8].copy_from_slice(&self.retention_hint.to_le_bytes());
         off += 8;
@@ -153,7 +153,7 @@ pub fn sign(
 /// procedure.
 ///
 /// This function establishes ONLY that the holder of `fields.signer`'s private
-/// key produced `signature` over the exact 216-byte sequence in
+/// key produced `signature` over the exact 208-byte sequence in
 /// `fields.canonical_bytes()`. It does NOT verify that any payload matches
 /// `data_hash`. Payload verification is the caller's responsibility, per spec
 /// §3.1 step 3.
@@ -195,7 +195,7 @@ mod tests {
             activity_hash: [0x03; HASH_LEN],
             data_hash: [0x04; HASH_LEN],
             witness_for: [0x05; HASH_LEN],
-            created_at: 1_753_910_400, // Aug 1 2026 UTC, arbitrary but stable
+            signer_asserted_at: 1_753_910_400, // Aug 1 2026 UTC, arbitrary but stable
             retention_hint: 30 * 24 * 60 * 60, // 30 days in seconds, arbitrary
             nonce: [0x08; HASH_LEN],
         }
@@ -220,7 +220,7 @@ mod tests {
             activity_hash: [0xA3; HASH_LEN],
             data_hash: [0xA4; HASH_LEN],
             witness_for: [0xA5; HASH_LEN],
-            created_at: 0x0102030405060708_i64,
+            signer_asserted_at: 0x0102030405060708_i64,
             retention_hint: 0x1112131415161718_i64,
             nonce: [0xA8; HASH_LEN],
         };
@@ -232,7 +232,7 @@ mod tests {
         //   64..96    activity_hash
         //   96..128   data_hash
         //   128..160  witness_for
-        //   160..168  created_at   (i64 little-endian)
+        //   160..168  signer_asserted_at   (i64 little-endian)
         //   168..176  retention_hint (i64 little-endian)
         //   176..208  nonce
         // Total 208 bytes exactly. No trailing padding.

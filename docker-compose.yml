@@ -1,0 +1,50 @@
+# SWORN reference stack for local development.
+#
+#   docker compose up
+#
+# starts Postgres and the sworn-api HTTP service. From another terminal:
+#
+#   cargo run -p sworn-cli -- keygen > my.key
+#   cargo run -p sworn-cli -- attest \
+#       --key my.key \
+#       --subject "sha256:$(printf 'hello' | shasum -a 256 | awk '{print $1}')" \
+#       --activity-type sworn.dev/v1/endorsement \
+#       --payload hello.json
+#
+# (or use `sworn` directly once `cargo install --path cli` is done)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sworn
+      POSTGRES_PASSWORD: sworn
+      POSTGRES_DB: sworn
+    ports:
+      - "5432:5432"
+    volumes:
+      - sworn_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sworn"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://sworn:sworn@postgres:5432/sworn
+      BIND: 0.0.0.0:8080
+      RUST_LOG: info,sqlx=warn
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  sworn_pgdata:

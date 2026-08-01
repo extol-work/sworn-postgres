@@ -4,7 +4,9 @@ Reference implementation of [SWORN](https://github.com/extol-work/sworn). Postgr
 
 ## Status
 
-**Pre-alpha.** Scaffold only. Implementation lands per [SCOPE.md](./SCOPE.md).
+**Pre-alpha.** Working end-to-end signing, notarization, and verification. Merkle
+batching and disclosure tokens are on the roadmap, not yet wired. See
+[SCOPE.md](./SCOPE.md) for what's in v0.1.
 
 ## What this is
 
@@ -24,15 +26,36 @@ Deliberately minimal:
 - The only conforming implementation (that's the point of the spec)
 - A demonstration of blockchain notarization (see the SWORN spec appendix on Solana / SAS binding, once that appendix drafts)
 
-## Quickstart (once implementation lands)
+## Quickstart
+
+Requires Docker (for Postgres + the API) and Rust (to build the CLI).
 
 ```bash
-# Coming soon:
+# 1. Build the CLI (one-time; installs to ~/.cargo/bin/sworn)
+cargo install --path cli
+
+# 2. Bring up Postgres + sworn-api
 docker compose up -d
+
+# 3. Attest and verify
 sworn keygen > my.key
-sworn attest --key my.key --subject sha256:abcdef... --payload hello.json
-sworn verify latest.sworn.json
+echo '{"kind":"endorsement","note":"hello"}' > hello.json
+sworn attest \
+    --key my.key \
+    --subject "sha256:$(printf 'my-subject' | shasum -a 256 | awk '{print $1}')" \
+    --activity-type sworn.dev/v1/endorsement \
+    --payload hello.json \
+    --out attestation.json
+sworn verify attestation.json
 ```
+
+Five lines to a first verified attestation. Every operation is expressible via
+curl if you prefer the wire directly; see `api/src/main.rs` for the OpenAPI
+shape.
+
+Offline verification (`sworn verify <file>`) works without contacting the API.
+Verification by id (`sworn verify <uuid>`) hits `GET /verify/:id` on a running
+sworn-api.
 
 ## Architecture at a glance
 
