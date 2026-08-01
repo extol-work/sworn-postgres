@@ -2033,6 +2033,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "ed25519-dalek",
  "serde",
  "serde_jcs",
  "serde_json",

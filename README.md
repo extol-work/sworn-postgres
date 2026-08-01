@@ -4,9 +4,10 @@ Reference implementation of [SWORN](https://github.com/extol-work/sworn). Postgr
 
 ## Status
 
-**Pre-alpha.** Working end-to-end signing, notarization, and verification. Merkle
-batching and disclosure tokens are on the roadmap, not yet wired. See
-[SCOPE.md](./SCOPE.md) for what's in v0.1.
+**Pre-alpha.** Working end-to-end: signing, notarization, verification, and the
+two-call disclosure flow (mint a token, redeem it once for the payload). Merkle
+batching is deferred to v0.2. The OpenAPI contract at [openapi.yaml](./openapi.yaml)
+is frozen for v0.1. See [SCOPE.md](./SCOPE.md) for what's in v0.1 and why.
 
 ## What this is
 
@@ -56,6 +57,30 @@ shape.
 Offline verification (`sworn verify <file>`) works without contacting the API.
 Verification by id (`sworn verify <uuid>`) hits `GET /verify/:id` on a running
 sworn-api.
+
+### Payload disclosure (two-call flow)
+
+Verification tells you the signature is authentic. If you also need the
+payload bytes (which live off the notarized hash), the signer mints a
+single-use token and hands it to you out-of-band. You redeem the token
+exactly once:
+
+```bash
+# Signer mints a token (uses my.key, only the original signer can).
+sworn disclosure-token --id <att-id> --key my.key --expires-in 3600
+#   -> token: <uuid>, expires_at: <unix seconds>
+
+# Whoever has the token retrieves the payload. Single-use.
+sworn disclose --id <att-id> --token <uuid> > payload.json
+```
+
+`POST /attestations/:id/disclose` returns 410 Gone on the second attempt.
+Rate-limited more aggressively than other endpoints (default 6 req/min).
+
+An end-to-end script that exercises every path (attest, verify, disclose,
+double-redeem, duplicate, refused list, tamper detection) lives at
+[`scripts/quickstart.sh`](./scripts/quickstart.sh). Point it at any running
+deployment via `SWORN_API_URL`.
 
 ## Architecture at a glance
 

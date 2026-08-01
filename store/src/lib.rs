@@ -166,6 +166,145 @@ pub async fn get_attestation(pool: &PgPool, id: Uuid) -> Result<Option<StoredAtt
     }))
 }
 
+/// Fetch just the payload for an attestation. Used by `/disclose` after a
+/// disclosure token has been redeemed.
+///
+/// Returns `Ok(None)` if the attestation exists but the payload has been
+/// reclaimed (retention hint expired and a reclaim job ran). Returns
+/// `Err(NotFound)`-style behavior at the store level by returning `Ok(None)`
+/// for both "row missing" and "payload null"; the handler distinguishes.
+pub async fn get_payload(pool: &PgPool, id: Uuid) -> Result<Option<serde_json::Value>, StoreError> {
+    let row = sqlx::query(r#"SELECT payload FROM attestations WHERE id = $1"#)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(row.get::<Option<serde_json::Value>, _>("payload"))
+}
+
+// ─── Disclosure tokens ─────────────────────────────────────────────
+
+/// A minted disclosure token that a subject / verifier can redeem exactly once.
+#[derive(Debug, Clone)]
+pub struct DisclosureToken {
+    pub token: Uuid,
+    pub attestation_id: Uuid,
+    pub expires_at_unix: i64,
+}
+
+/// Result of attempting to redeem a token.
+#[derive(Debug)]
+pub enum TokenRedemption {
+    /// Token valid; caller may serve the payload.
+    Granted { attestation_id: Uuid },
+    /// Token unknown.
+    Unknown,
+    /// Token already used or explicitly revoked.
+    AlreadyRedeemed,
+    /// Token expired before redemption.
+    Expired,
+}
+
+/// Insert a new disclosure token for `attestation_id`.
+///
+/// `expires_in_secs` is capped at 7 days to bound the reference implementation's
+/// exposure window; real deployments should tune. `issuance_nonce` is the
+/// 32-byte anti-replay nonce the signer included in their signed request.
+///
+/// Returns `StoreError::Duplicate(existing_token_id)` if the same
+/// `(attestation_id, issuance_nonce)` was already used to mint a token.
+pub async fn create_disclosure_token(
+    pool: &PgPool,
+    attestation_id: Uuid,
+    issuance_nonce: &[u8; 32],
+    expires_in_secs: i64,
+) -> Result<DisclosureToken, StoreError> {
+    let expires_in_secs = expires_in_secs.clamp(60, 7 * 24 * 60 * 60);
+
+    let insert = sqlx::query(
+        r#"
+        INSERT INTO disclosure_tokens (attestation_id, expires_at, issuance_nonce)
+        VALUES ($1, NOW() + make_interval(secs => $2::double precision), $3)
+        RETURNING token, expires_at
+        "#,
+    )
+    .bind(attestation_id)
+    .bind(expires_in_secs as f64)
+    .bind(&issuance_nonce[..])
+    .fetch_one(pool)
+    .await;
+
+    match insert {
+        Ok(row) => {
+            let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
+            Ok(DisclosureToken {
+                token: row.get("token"),
+                attestation_id,
+                expires_at_unix: expires_at.timestamp(),
+            })
+        }
+        Err(sqlx::Error::Database(db)) if db.constraint() == Some("one_token_per_issuance") => {
+            let existing: Uuid = sqlx::query_scalar(
+                r#"SELECT token FROM disclosure_tokens WHERE attestation_id = $1 AND issuance_nonce = $2"#,
+            )
+            .bind(attestation_id)
+            .bind(&issuance_nonce[..])
+            .fetch_one(pool)
+            .await?;
+            Err(StoreError::Duplicate(existing))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Attempt to redeem a disclosure token atomically.
+///
+/// If the token is valid and unredeemed, this marks it redeemed and returns
+/// `Granted`. All state transitions happen in a single UPDATE so concurrent
+/// redemptions of the same token race safely to exactly one winner.
+pub async fn redeem_disclosure_token(
+    pool: &PgPool,
+    token: Uuid,
+) -> Result<TokenRedemption, StoreError> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE disclosure_tokens
+           SET redeemed_at = NOW()
+         WHERE token = $1
+           AND redeemed_at IS NULL
+           AND expires_at > NOW()
+        RETURNING attestation_id
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = updated {
+        return Ok(TokenRedemption::Granted { attestation_id: row.get("attestation_id") });
+    }
+
+    // Update didn't hit anything; distinguish unknown vs already-redeemed vs expired.
+    let existing = sqlx::query(
+        r#"SELECT redeemed_at, expires_at FROM disclosure_tokens WHERE token = $1"#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(match existing {
+        None => TokenRedemption::Unknown,
+        Some(row) => {
+            let redeemed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("redeemed_at");
+            if redeemed_at.is_some() {
+                TokenRedemption::AlreadyRedeemed
+            } else {
+                TokenRedemption::Expired
+            }
+        }
+    })
+}
+
 /// Explicitly refused: listing attestations by signer.
 /// Kept as a function so callers see the signature and get a compiler-level
 /// nudge that this is not a supported operation.

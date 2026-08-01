@@ -68,6 +68,29 @@ enum Cmd {
         /// Attestation id (UUID) OR a path to a local sworn.json file.
         target: String,
     },
+    /// Mint a single-use disclosure token authorizing payload retrieval.
+    ///
+    /// You must be (or hold the key of) the attestation's original signer.
+    DisclosureToken {
+        /// Attestation id (UUID).
+        #[arg(long)]
+        id: uuid::Uuid,
+        /// Path to the signer's keyfile (produced by `sworn keygen`).
+        #[arg(long)]
+        key: PathBuf,
+        /// Token lifetime in seconds. Server clamps to [60, 604800].
+        #[arg(long, default_value_t = 3600)]
+        expires_in: i64,
+    },
+    /// Redeem a disclosure token and print the payload JSON to stdout.
+    Disclose {
+        /// Attestation id the token was issued for.
+        #[arg(long)]
+        id: uuid::Uuid,
+        /// Token UUID (from `sworn disclosure-token`).
+        #[arg(long)]
+        token: uuid::Uuid,
+    },
 }
 
 // ─── Wire types (mirrors api/src/main.rs; kept minimal here) ─────────
@@ -156,6 +179,10 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Verify { target } => cmd_verify(&cli.api_url, &target).await,
+        Cmd::DisclosureToken { id, key, expires_in } => {
+            cmd_disclosure_token(&cli.api_url, id, &key, expires_in).await
+        }
+        Cmd::Disclose { id, token } => cmd_disclose(&cli.api_url, id, token).await,
     }
 }
 
@@ -359,6 +386,121 @@ async fn cmd_verify(api_url: &str, target: &str) -> Result<()> {
             }
         }
     }
+}
+
+// ─── Disclosure token commands ─────────────────────────────────────
+
+#[derive(Serialize)]
+struct CreateTokenReq {
+    expires_in_secs: i64,
+    issuance_nonce: String,
+    signature: String,
+}
+
+#[derive(Deserialize)]
+struct CreateTokenResp {
+    token: uuid::Uuid,
+    expires_at: i64,
+    #[allow(dead_code)]
+    attestation_id: uuid::Uuid,
+}
+
+#[derive(Serialize)]
+struct DiscloseReq {
+    token: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+struct DiscloseResp {
+    attestation_id: uuid::Uuid,
+    payload: serde_json::Value,
+    data_hash: String,
+    #[allow(dead_code)]
+    signer_pubkey: String,
+    #[allow(dead_code)]
+    signer_asserted_at: i64,
+    #[allow(dead_code)]
+    notarized_at: i64,
+}
+
+async fn cmd_disclosure_token(
+    api_url: &str,
+    id: uuid::Uuid,
+    keyfile: &std::path::Path,
+    expires_in_secs: i64,
+) -> Result<()> {
+    let (signing_key, pk_bytes) = load_key(keyfile)?;
+
+    // Mirror the server's canonical layout exactly.
+    // b"sworn-disclosure-token-v1" || uuid(16) || i64_le(8) || nonce(32) = 81 bytes.
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let mut msg = Vec::with_capacity(81);
+    msg.extend_from_slice(b"sworn-disclosure-token-v1");
+    msg.extend_from_slice(id.as_bytes());
+    msg.extend_from_slice(&expires_in_secs.to_le_bytes());
+    msg.extend_from_slice(&nonce);
+
+    use ed25519_dalek::Signer;
+    let sig = signing_key.sign(&msg);
+
+    let req = CreateTokenReq {
+        expires_in_secs,
+        issuance_nonce: B64.encode(nonce),
+        signature: B64.encode(sig.to_bytes()),
+    };
+
+    let url = format!(
+        "{}/attestations/{}/disclosure-tokens",
+        api_url.trim_end_matches('/'),
+        id
+    );
+    let resp = reqwest::Client::new().post(&url).json(&req).send().await?;
+    let status = resp.status();
+    let body_text = resp.text().await?;
+    if !status.is_success() {
+        bail!("api returned {}: {}", status, body_text);
+    }
+    let ok: CreateTokenResp = serde_json::from_str(&body_text)?;
+    println!("token:      {}", ok.token);
+    println!("expires_at: {}", ok.expires_at);
+    println!("issued_by:  {}", B64.encode(pk_bytes));
+    eprintln!(
+        "\n# Redeem with:\n#   sworn disclose --id {} --token {}",
+        id, ok.token
+    );
+    Ok(())
+}
+
+async fn cmd_disclose(api_url: &str, id: uuid::Uuid, token: uuid::Uuid) -> Result<()> {
+    let req = DiscloseReq { token };
+    let url = format!(
+        "{}/attestations/{}/disclose",
+        api_url.trim_end_matches('/'),
+        id
+    );
+    let resp = reqwest::Client::new().post(&url).json(&req).send().await?;
+    let status = resp.status();
+    let body_text = resp.text().await?;
+    if !status.is_success() {
+        bail!("api returned {}: {}", status, body_text);
+    }
+    let ok: DiscloseResp = serde_json::from_str(&body_text)?;
+
+    // Re-verify locally: recompute data_hash of the payload we received and
+    // compare with the server's echoed value. Cheap paranoia; catches a
+    // pathological server that swapped payloads between attestations.
+    let canonical = serde_jcs::to_vec(&ok.payload).context("re-canonicalize payload")?;
+    let recomputed: [u8; 32] = Sha256::digest(&canonical).into();
+    let server_hash = B64.decode(&ok.data_hash).context("server data_hash decode")?;
+    if server_hash.as_slice() != recomputed {
+        bail!("data_hash mismatch: server-echoed hash does not match SHA-256 of returned payload");
+    }
+
+    eprintln!("attestation_id: {}", ok.attestation_id);
+    eprintln!("data_hash:      {}", ok.data_hash);
+    println!("{}", serde_json::to_string_pretty(&ok.payload)?);
+    Ok(())
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────

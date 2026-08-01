@@ -1,22 +1,26 @@
 //! sworn-api — HTTP server for the SWORN reference implementation.
 //!
 //! Endpoints (v0.1):
-//!   POST   /attestations           create + verify + store
-//!   GET    /attestations/:id       metadata only, no payload
-//!   GET    /verify/:id             re-verify a stored attestation
-//!   GET    /healthz                liveness
+//!   POST   /attestations                              create + verify + store
+//!   GET    /attestations/:id                          metadata only, no payload
+//!   POST   /attestations/:id/disclosure-tokens        signer mints a redemption token
+//!   POST   /attestations/:id/disclose                 redeem a token, receive payload
+//!   GET    /verify/:id                                re-verify a stored attestation
+//!   GET    /healthz                                   liveness
 //!
-//! Deliberately refused:
+//! Deliberately refused (return 400 with a message):
 //!   GET    /attestations           bulk enumeration
 //!   GET    /attestations?signer=X  list by signer
 //!   GET    /attestations?subject=X list by subject
 //!
-//! Refusals return 400 with a message pointing to the spec's shown-never-pulled
-//! discipline. They exist so implementers testing conformance find them.
+//! Rate limits (in-memory, per-IP token bucket):
+//!   default: 60 req/min
+//!   POST /attestations/:id/disclose: 6 req/min (tighter cap to slow enumeration)
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -25,7 +29,10 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use sworn_verify::{verify, AttestationFields};
 use tracing::info;
 use uuid::Uuid;
@@ -35,6 +42,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     pool: Arc<PgPool>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 // ─── Wire types ─────────────────────────────────────────────────────
@@ -100,6 +108,47 @@ struct VerifyResponse {
     attestation_id: Uuid,
 }
 
+/// Client body for POST /attestations/:id/disclosure-tokens.
+///
+/// The signer proves control by signing the tuple
+///   b"sworn-disclosure-token-v1" || attestation_id_bytes(16)
+///                                 || expires_in_secs.to_le_bytes()(8)
+///                                 || issuance_nonce(32)
+/// with the same private key that produced the attestation's signature.
+#[derive(Debug, Deserialize)]
+struct CreateTokenRequest {
+    /// How long (seconds) the minted token should remain valid. Server caps at 7 days.
+    expires_in_secs: i64,
+    /// 32 bytes, base64. Fresh per issuance; also serves as replay guard.
+    issuance_nonce: String,
+    /// 64 bytes, base64. Ed25519 signature over the tuple above by the attestation's signer.
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateTokenResponse {
+    token: Uuid,
+    expires_at: i64,
+    attestation_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscloseRequest {
+    token: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscloseResponse {
+    attestation_id: Uuid,
+    payload: serde_json::Value,
+    /// Server-computed on the fly so caller can re-verify without a second call.
+    data_hash: String,
+    /// Echoed so caller can cross-check against a previously fetched metadata view.
+    signer_pubkey: String,
+    signer_asserted_at: i64,
+    notarized_at: i64,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: &'static str,
@@ -118,6 +167,12 @@ enum ApiError {
     Duplicate(Uuid),
     #[error("not found")]
     NotFound,
+    #[error("gone: {0}")]
+    Gone(&'static str),
+    #[error("unauthorized: {0}")]
+    Unauthorized(&'static str),
+    #[error("rate limited")]
+    RateLimited,
     #[error("refused: {0}")]
     Refused(&'static str),
     #[error("internal: {0}")]
@@ -141,7 +196,23 @@ impl IntoResponse for ApiError {
             ),
             ApiError::NotFound => (
                 StatusCode::NOT_FOUND,
-                ErrorBody { error: "not_found", message: "attestation not found".into(), existing_id: None },
+                ErrorBody { error: "not_found", message: "not found".into(), existing_id: None },
+            ),
+            ApiError::Gone(reason) => (
+                StatusCode::GONE,
+                ErrorBody { error: "gone", message: reason.to_string(), existing_id: None },
+            ),
+            ApiError::Unauthorized(reason) => (
+                StatusCode::UNAUTHORIZED,
+                ErrorBody { error: "unauthorized", message: reason.to_string(), existing_id: None },
+            ),
+            ApiError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorBody {
+                    error: "rate_limited",
+                    message: "Too many requests. Slow down and try again.".into(),
+                    existing_id: None,
+                },
             ),
             ApiError::Refused(reason) => (
                 StatusCode::BAD_REQUEST,
@@ -161,6 +232,78 @@ impl IntoResponse for ApiError {
         };
         (status, Json(body)).into_response()
     }
+}
+
+// ─── Rate limiter (in-memory token bucket, per IP + route class) ────
+//
+// Two classes: default (60 req/min) and disclose (6 req/min). The disclose
+// bucket is tighter because /disclose returns payload bytes and is the one
+// endpoint a hostile enumerator would hammer if they got a leaked token.
+// In-memory is fine for a reference implementation; production deploys
+// front this with a real limiter (nginx, envoy, cloud rate limiting).
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Bucket {
+    Default,
+    Disclose,
+}
+
+struct Bucketed {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+struct RateLimiter {
+    per_ip: Mutex<HashMap<(IpAddr, Bucket), Bucketed>>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self { per_ip: Mutex::new(HashMap::new()) }
+    }
+
+    /// Consume 1 token; return false if the bucket is empty.
+    fn allow(&self, ip: IpAddr, bucket: Bucket) -> bool {
+        let (capacity, refill_per_sec) = match bucket {
+            Bucket::Default => (60.0, 1.0),   // 60 tokens, +1/sec => 60/min sustained
+            Bucket::Disclose => (6.0, 0.1),   // 6 tokens, +6/min sustained
+        };
+
+        let mut map = self.per_ip.lock().expect("rate limiter mutex poisoned");
+        let now = Instant::now();
+        let entry = map.entry((ip, bucket)).or_insert(Bucketed { tokens: capacity, last_refill: now });
+
+        let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
+        entry.tokens = (entry.tokens + elapsed * refill_per_sec).min(capacity);
+        entry.last_refill = now;
+
+        if entry.tokens >= 1.0 {
+            entry.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+async fn rate_limit_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let bucket = if path.ends_with("/disclose") { Bucket::Disclose } else { Bucket::Default };
+
+    // Client IP: use the connecting peer. Behind a proxy, the operator should
+    // configure X-Forwarded-For handling at that layer; we don't parse it here
+    // because misparsing can be worse than not parsing.
+    let ip = addr.ip();
+
+    if !state.rate_limiter.allow(ip, bucket) {
+        return ApiError::RateLimited.into_response();
+    }
+    next.run(req).await
 }
 
 // ─── Handlers ──────────────────────────────────────────────────────
@@ -274,6 +417,116 @@ async fn verify_attestation(
     Ok(Json(VerifyResponse { valid, reason, attestation_id: row.id }))
 }
 
+/// POST /attestations/:id/disclosure-tokens
+///
+/// Mint a single-use, time-limited disclosure token. Requires the caller to
+/// prove control of the attestation's signing key by signing a canonical
+/// issuance message (see `token_issuance_bytes`).
+async fn create_disclosure_token(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<CreateTokenResponse>), ApiError> {
+    let nonce = b64_32(&req.issuance_nonce, "issuance_nonce")?;
+    let signature = b64_64(&req.signature, "signature")?;
+
+    if req.expires_in_secs < 60 || req.expires_in_secs > 7 * 24 * 60 * 60 {
+        return Err(ApiError::BadRequest(
+            "expires_in_secs must be between 60 and 604800 (7 days)".into(),
+        ));
+    }
+
+    // Fetch attestation to recover the signer pubkey.
+    let att = sworn_store::get_attestation(&state.pool, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+
+    // Verify the issuance signature was made by the attestation's signer.
+    let msg = token_issuance_bytes(id, req.expires_in_secs, &nonce);
+    ed25519_verify(&att.fields.signer, &msg, &signature)
+        .map_err(|_| ApiError::Unauthorized("issuance signature does not match attestation signer"))?;
+
+    // Mint. Duplicate (same nonce) returns the existing token id rather than
+    // an error — issuance is idempotent per (attestation, nonce).
+    match sworn_store::create_disclosure_token(&state.pool, id, &nonce, req.expires_in_secs).await {
+        Ok(tok) => Ok((
+            StatusCode::CREATED,
+            Json(CreateTokenResponse {
+                token: tok.token,
+                expires_at: tok.expires_at_unix,
+                attestation_id: tok.attestation_id,
+            }),
+        )),
+        Err(sworn_store::StoreError::Duplicate(existing_token)) => Ok((
+            StatusCode::OK,
+            Json(CreateTokenResponse {
+                token: existing_token,
+                expires_at: 0, // caller had the previous response; not re-derived here
+                attestation_id: id,
+            }),
+        )),
+        Err(e) => Err(ApiError::Internal(e.to_string())),
+    }
+}
+
+/// POST /attestations/:id/disclose
+///
+/// Redeem a disclosure token and receive the payload. The token is marked
+/// consumed atomically; a second attempt returns 410 Gone.
+async fn disclose_payload(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<DiscloseRequest>,
+) -> Result<Json<DiscloseResponse>, ApiError> {
+    let redemption = sworn_store::redeem_disclosure_token(&state.pool, req.token)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let granted_id = match redemption {
+        sworn_store::TokenRedemption::Granted { attestation_id } => attestation_id,
+        sworn_store::TokenRedemption::Unknown => return Err(ApiError::NotFound),
+        sworn_store::TokenRedemption::AlreadyRedeemed => {
+            return Err(ApiError::Gone("Token was already redeemed."))
+        }
+        sworn_store::TokenRedemption::Expired => {
+            return Err(ApiError::Gone("Token expired before redemption."))
+        }
+    };
+
+    if granted_id != id {
+        return Err(ApiError::BadRequest(
+            "Token was issued for a different attestation id.".into(),
+        ));
+    }
+
+    let payload = sworn_store::get_payload(&state.pool, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::Gone("Payload has been reclaimed."))?;
+
+    let meta = sworn_store::get_attestation(&state.pool, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+
+    // Recompute data_hash so the caller can independently confirm the payload
+    // matches what was signed. If a reclaim job silently swapped payload bytes
+    // this would surface as a mismatch when the caller re-hashes.
+    let canonical = serde_jcs::to_vec(&payload)
+        .map_err(|e| ApiError::Internal(format!("payload canonicalization failed: {}", e)))?;
+    let data_hash: [u8; 32] = Sha256::digest(&canonical).into();
+
+    Ok(Json(DiscloseResponse {
+        attestation_id: id,
+        payload,
+        data_hash: B64.encode(data_hash),
+        signer_pubkey: B64.encode(meta.fields.signer),
+        signer_asserted_at: meta.fields.signer_asserted_at,
+        notarized_at: meta.notarized_at,
+    }))
+}
+
 /// Any GET on /attestations WITHOUT an id is a refused list operation.
 async fn refused_list(Query(_q): Query<serde_json::Value>) -> Result<(), ApiError> {
     Err(ApiError::Refused("list-by-signer, list-by-subject, and bulk enumeration are not supported"))
@@ -297,6 +550,34 @@ fn b64_64(s: &str, field: &str) -> Result<[u8; 64], ApiError> {
     })
 }
 
+/// Canonical byte sequence signed by the attestation signer to authorize
+/// issuance of a disclosure token. Structure is deliberately different from
+/// the attestation canonical bytes (§3.1) so a leaked attestation signature
+/// can NEVER be replayed as a token-issuance signature.
+///
+/// Layout:
+///   b"sworn-disclosure-token-v1"  (25 bytes, domain separator)
+///   || attestation_id             (16 bytes, big-endian UUID)
+///   || expires_in_secs            (8 bytes, i64 little-endian)
+///   || issuance_nonce             (32 bytes)
+///
+/// Total: 81 bytes.
+fn token_issuance_bytes(id: Uuid, expires_in_secs: i64, nonce: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(81);
+    out.extend_from_slice(b"sworn-disclosure-token-v1");
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&expires_in_secs.to_le_bytes());
+    out.extend_from_slice(nonce);
+    out
+}
+
+fn ed25519_verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> Result<(), ()> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let vk = VerifyingKey::from_bytes(pubkey).map_err(|_| ())?;
+    let signature = Signature::from_bytes(sig);
+    vk.verify(msg, &signature).map_err(|_| ())
+}
+
 // ─── main ───────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -317,18 +598,56 @@ async fn main() -> anyhow::Result<()> {
     info!("running migrations");
     sworn_store::migrate(&pool).await?;
 
-    let state = AppState { pool: Arc::new(pool) };
+    let state = AppState {
+        pool: Arc::new(pool),
+        rate_limiter: Arc::new(RateLimiter::new()),
+    };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/attestations", post(create_attestation).get(refused_list))
         .route("/attestations/:id", get(get_attestation))
+        .route("/attestations/:id/disclosure-tokens", post(create_disclosure_token))
+        .route("/attestations/:id/disclose", post(disclose_payload))
         .route("/verify/:id", get(verify_attestation))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("sworn-api listening on {}", bind);
-    axum::serve(listener, app).await?;
+    let make_svc = app.into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, make_svc).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issuance_bytes_are_exactly_81() {
+        let id = Uuid::from_bytes([1u8; 16]);
+        let nonce = [7u8; 32];
+        let msg = token_issuance_bytes(id, 3600, &nonce);
+        assert_eq!(msg.len(), 81);
+        // Domain separator at the front, unambiguous with attestation canonical bytes.
+        assert!(msg.starts_with(b"sworn-disclosure-token-v1"));
+    }
+
+    #[test]
+    fn issuance_bytes_change_with_nonce() {
+        let id = Uuid::from_bytes([1u8; 16]);
+        let a = token_issuance_bytes(id, 3600, &[0u8; 32]);
+        let b = token_issuance_bytes(id, 3600, &[1u8; 32]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn issuance_bytes_change_with_expiry() {
+        let id = Uuid::from_bytes([1u8; 16]);
+        let a = token_issuance_bytes(id, 3600, &[0u8; 32]);
+        let b = token_issuance_bytes(id, 3601, &[0u8; 32]);
+        assert_ne!(a, b);
+    }
 }

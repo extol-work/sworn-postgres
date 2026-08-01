@@ -1,0 +1,466 @@
+openapi: 3.1.0
+info:
+  title: sworn-postgres API
+  version: 0.1.0
+  description: |
+    Reference implementation of the SWORN specification.
+
+    This document is the frozen contract for v0.1. Any implementation of the
+    SWORN specification MAY implement these endpoints exactly as described
+    here; a conformance suite lives alongside this file in the same repo.
+
+    Binary field encoding: base64 (standard alphabet, with padding) unless
+    explicitly noted otherwise.
+
+    Refused operations: the spec's shown-never-pulled discipline (Layer 5)
+    is expressed by refusing enumeration endpoints with HTTP 400 and an
+    explanatory message. See `GET /attestations` below.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: '{scheme}://{host}'
+    description: User-supplied deployment
+    variables:
+      scheme:
+        default: https
+        enum: [http, https]
+      host:
+        default: sworn.example.com
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      description: Returns "ok" when the server is reachable and DB pool is up.
+      operationId: healthz
+      responses:
+        '200':
+          description: Live
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+
+  /attestations:
+    post:
+      summary: Create an attestation
+      description: |
+        Validates the provided Ed25519 signature against the canonical byte
+        sequence (spec §3.1) and stores the record if valid.
+
+        Idempotency: two POSTs with the same
+        `(signer_pubkey, subject, activity_hash, data_hash, nonce)` tuple
+        return HTTP 409 with the existing id.
+      operationId: createAttestation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAttestationRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAttestationResponse'
+        '400':
+          description: Bad request (invalid field encoding, canonicalization failure, signature invalid)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Duplicate attestation. `existing_id` returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DuplicateError'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: Refused — enumeration is not supported
+      description: |
+        `GET /attestations` in any form (bulk, by signer, by subject) returns
+        400 with an explanatory refusal. This behavior is part of the SWORN
+        spec's shown-never-pulled discipline. Any conforming implementation
+        MUST refuse these operations.
+      operationId: refusedList
+      responses:
+        '400':
+          description: Refused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /attestations/{id}:
+    get:
+      summary: Fetch attestation metadata (no payload)
+      description: |
+        Returns everything needed to independently verify the signature
+        against the canonical byte sequence. Does NOT return the payload;
+        that requires a disclosure token (see below).
+      operationId: getAttestation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Attestation metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttestationView'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /attestations/{id}/disclosure-tokens:
+    post:
+      summary: Mint a disclosure token
+      description: |
+        The attestation's original signer proves control by signing a
+        canonical issuance message (see below) with the same private key
+        that produced the attestation's signature. The server mints a
+        single-use, time-limited token that authorizes exactly one call to
+        `POST /attestations/{id}/disclose`.
+
+        Canonical issuance message layout (81 bytes, no framing):
+
+            b"sworn-disclosure-token-v1"      (25 bytes)
+            || attestation_id_big_endian      (16 bytes)
+            || expires_in_secs.to_le_bytes()  (8 bytes, i64)
+            || issuance_nonce                 (32 bytes)
+
+        A leaked attestation signature CANNOT be replayed as a token-issuance
+        signature because the domain-separator prefix differs.
+
+        Idempotency: reusing the same `issuance_nonce` for the same
+        attestation returns the previously-issued token id.
+      operationId: createDisclosureToken
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTokenRequest'
+      responses:
+        '200':
+          description: Duplicate issuance; existing token returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTokenResponse'
+        '201':
+          description: Token minted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Issuance signature does not match the attestation's signer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /attestations/{id}/disclose:
+    post:
+      summary: Redeem a disclosure token, receive the payload
+      description: |
+        Marks the token consumed atomically and returns the attestation's
+        payload plus its server-computed `data_hash` for independent
+        re-verification. A second call with the same token returns 410 Gone.
+
+        Rate limited more aggressively than other endpoints (default 6 req/min)
+        to slow enumeration in the event of a token leak.
+      operationId: disclosePayload
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscloseRequest'
+      responses:
+        '200':
+          description: Payload disclosed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscloseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Token unknown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '410':
+          description: Token expired, already redeemed, or payload reclaimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /verify/{id}:
+    get:
+      summary: Re-verify a stored attestation's signature
+      description: |
+        Loads the attestation, reconstructs the canonical byte sequence, and
+        re-verifies the signature. Returns a boolean plus a machine-readable
+        reason code. Does NOT return payload.
+      operationId: verifyAttestation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+components:
+  responses:
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Too many requests.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          examples: [bad_request, not_found, gone, unauthorized, rate_limited, refused, internal]
+        message:
+          type: string
+
+    DuplicateError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            existing_id:
+              type: string
+              format: uuid
+
+    CreateAttestationRequest:
+      type: object
+      required: [signer_pubkey, subject, activity_type_uri, signer_asserted_at, retention_hint, nonce, signature, payload]
+      properties:
+        signer_pubkey:
+          type: string
+          description: 32 bytes, base64.
+        subject:
+          type: string
+          description: 32 bytes, base64.
+        activity_type_uri:
+          type: string
+          description: Absolute URI naming the activity type (spec §2.2).
+        witness_for:
+          type: string
+          nullable: true
+          description: 32 bytes, base64. Omit or send "" for none.
+        signer_asserted_at:
+          type: integer
+          format: int64
+          description: Signer's self-claimed unix seconds. Informational only.
+        retention_hint:
+          type: integer
+          format: int64
+          description: Seconds; -1 = permanent.
+        nonce:
+          type: string
+          description: 32 bytes, base64. Fresh per attestation.
+        signature:
+          type: string
+          description: 64 bytes, base64. Ed25519 over canonical bytes.
+        payload:
+          description: |
+            The full JSON payload. `SHA-256(RFC-8785(payload))` MUST equal
+            the `data_hash` embedded in the signed canonical bytes.
+
+    CreateAttestationResponse:
+      type: object
+      required: [id, notarized_at, data_hash, activity_hash]
+      properties:
+        id:
+          type: string
+          format: uuid
+        notarized_at:
+          type: integer
+          format: int64
+          description: Server clock unix seconds. Trust-relevant per OPEN_QUESTIONS Q2.
+        data_hash:
+          type: string
+          description: 32 bytes, base64.
+        activity_hash:
+          type: string
+          description: 32 bytes, base64.
+
+    AttestationView:
+      type: object
+      required:
+        - id
+        - signer_pubkey
+        - subject
+        - activity_type_uri
+        - activity_hash
+        - data_hash
+        - witness_for
+        - signer_asserted_at
+        - notarized_at
+        - retention_hint
+        - nonce
+        - signature
+      properties:
+        id: { type: string, format: uuid }
+        signer_pubkey: { type: string }
+        subject: { type: string }
+        activity_type_uri: { type: string }
+        activity_hash: { type: string }
+        data_hash: { type: string }
+        witness_for: { type: string, description: 'Zeros when unused.' }
+        signer_asserted_at: { type: integer, format: int64 }
+        notarized_at: { type: integer, format: int64 }
+        retention_hint: { type: integer, format: int64 }
+        nonce: { type: string }
+        signature: { type: string }
+
+    VerifyResponse:
+      type: object
+      required: [valid, reason, attestation_id]
+      properties:
+        valid:
+          type: boolean
+        reason:
+          type: string
+          examples: [signature_verified, signature_invalid]
+        attestation_id:
+          type: string
+          format: uuid
+
+    CreateTokenRequest:
+      type: object
+      required: [expires_in_secs, issuance_nonce, signature]
+      properties:
+        expires_in_secs:
+          type: integer
+          format: int64
+          minimum: 60
+          maximum: 604800
+        issuance_nonce:
+          type: string
+          description: 32 bytes, base64.
+        signature:
+          type: string
+          description: 64 bytes, base64. Ed25519 over the canonical issuance message.
+
+    CreateTokenResponse:
+      type: object
+      required: [token, expires_at, attestation_id]
+      properties:
+        token:
+          type: string
+          format: uuid
+        expires_at:
+          type: integer
+          format: int64
+          description: Server clock unix seconds.
+        attestation_id:
+          type: string
+          format: uuid
+
+    DiscloseRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          format: uuid
+
+    DiscloseResponse:
+      type: object
+      required: [attestation_id, payload, data_hash, signer_pubkey, signer_asserted_at, notarized_at]
+      properties:
+        attestation_id:
+          type: string
+          format: uuid
+        payload:
+          description: Original JSON payload.
+        data_hash:
+          type: string
+          description: 32 bytes, base64. Server-computed on the fly for independent re-verification.
+        signer_pubkey:
+          type: string
+        signer_asserted_at:
+          type: integer
+          format: int64
+        notarized_at:
+          type: integer
+          format: int64
