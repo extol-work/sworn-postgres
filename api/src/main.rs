@@ -56,19 +56,35 @@ struct CreateAttestationRequest {
     signer_pubkey: String,
     /// 32 bytes, base64. Application-defined subject identifier.
     subject: String,
-    /// Absolute URI naming the activity type (§2.2).
+    /// Absolute URI naming the activity type (SPEC §2.2).
     activity_type_uri: String,
-    /// 32 bytes, base64. Optional — omit or send "" for none.
+    /// 32 bytes, base64. Optional; omit or send "" for none.
     #[serde(default)]
     witness_for: Option<String>,
+
+    /// v0.1-final provenance (SPEC §2.5). All required.
+    ///
+    /// 32 bytes, base64. MUST be all-zero when source_type is Unknown (0)
+    /// or SelfReported (1); otherwise SHA-256 of canonical source identifier
+    /// per SPEC §9.2.
+    source_hash: String,
+    /// Registered value from SPEC §9.2. 0-14 currently defined.
+    source_type: u16,
+    /// Signer's confidence in basis points, 0-10000. Snapshot at signing time.
+    confidence: u16,
+    /// Registered value from SPEC §9.3. 0-5 currently defined.
+    witnessing_depth: u8,
+    /// Registered value from SPEC §9.4. 0-6 currently defined.
+    attestor_relationship: u8,
+
     /// Signer-asserted timestamp (int64, unix seconds). Informational only
-    /// per OPEN_QUESTIONS Q2; verifiers MUST NOT use for trust decisions.
+    /// per SPEC §2.5.1; verifiers MUST NOT use for trust decisions.
     signer_asserted_at: i64,
     /// Retention hint (int64, seconds; -1 = permanent).
     retention_hint: i64,
     /// 32 bytes, base64.
     nonce: String,
-    /// 64 bytes, base64.
+    /// 64 bytes, base64. Ed25519 over the 248-byte v0.1-final canonical bytes.
     signature: String,
     /// The full JSON payload. `SHA-256(RFC-8785(payload))` MUST equal the
     /// data_hash inside the canonical bytes that `signature` covers.
@@ -82,11 +98,13 @@ struct CreateAttestationResponse {
     /// Echoed back so callers can confirm what was stored.
     data_hash: String,
     activity_hash: String,
+    spec_version: i16,
 }
 
 #[derive(Debug, Serialize)]
 struct AttestationView {
     id: Uuid,
+    spec_version: i16,
     signer_pubkey: String,
     subject: String,
     activity_type_uri: String,
@@ -94,6 +112,14 @@ struct AttestationView {
     data_hash: String,
     /// Base64. Zero-bytes when no witness endorsement.
     witness_for: String,
+    /// Base64. Zero-bytes when source_type is Unknown or SelfReported.
+    source_hash: String,
+    source_type: u16,
+    confidence: u16,
+    witnessing_depth: u8,
+    attestor_relationship: u8,
+    /// 'original' or 'backfilled'. See IMPLEMENTATION_NOTES.md.
+    provenance_origin: String,
     signer_asserted_at: i64,
     notarized_at: i64,
     retention_hint: i64,
@@ -335,12 +361,42 @@ async fn create_attestation(
         .map_err(|e| ApiError::BadRequest(format!("payload canonicalization failed: {}", e)))?;
     let data_hash: [u8; 32] = Sha256::digest(&canonical_payload).into();
 
+    // Decode + validate the v0.1-final provenance enums per SPEC §2.5, §9.2-9.4.
+    let source_hash = b64_32(&req.source_hash, "source_hash")?;
+
+    let source_type = sworn_verify::SourceType::from_u16(req.source_type)
+        .ok_or_else(|| ApiError::BadRequest(format!(
+            "unknown source_type value {}; see SPEC §9.2 for registered values",
+            req.source_type
+        )))?;
+    let witnessing_depth = sworn_verify::WitnessingDepth::from_u8(req.witnessing_depth)
+        .ok_or_else(|| ApiError::BadRequest(format!(
+            "unknown witnessing_depth value {}; see SPEC §9.3 for registered values",
+            req.witnessing_depth
+        )))?;
+    let attestor_relationship = sworn_verify::AttestorRelationship::from_u8(req.attestor_relationship)
+        .ok_or_else(|| ApiError::BadRequest(format!(
+            "unknown attestor_relationship value {}; see SPEC §9.4 for registered values",
+            req.attestor_relationship
+        )))?;
+    if req.confidence > 10_000 {
+        return Err(ApiError::BadRequest(format!(
+            "confidence {} exceeds 10000 basis-points ceiling per SPEC §2.5",
+            req.confidence
+        )));
+    }
+
     let fields = AttestationFields {
         signer: signer_pubkey,
         subject,
         activity_hash,
         data_hash,
         witness_for,
+        source_hash,
+        source_type,
+        confidence: req.confidence,
+        witnessing_depth,
+        attestor_relationship,
         signer_asserted_at: req.signer_asserted_at,
         retention_hint: req.retention_hint,
         nonce,
@@ -368,6 +424,7 @@ async fn create_attestation(
                 notarized_at,
                 data_hash: B64.encode(data_hash),
                 activity_hash: B64.encode(activity_hash),
+                spec_version: 2,
             }),
         )),
         Err(sworn_store::StoreError::Duplicate(existing_id)) => Err(ApiError::Duplicate(existing_id)),
@@ -386,12 +443,19 @@ async fn get_attestation(
 
     Ok(Json(AttestationView {
         id: row.id,
+        spec_version: row.spec_version,
         signer_pubkey: B64.encode(row.fields.signer),
         subject: B64.encode(row.fields.subject),
         activity_type_uri: row.activity_type_uri,
         activity_hash: B64.encode(row.fields.activity_hash),
         data_hash: B64.encode(row.fields.data_hash),
         witness_for: B64.encode(row.fields.witness_for),
+        source_hash: B64.encode(row.fields.source_hash),
+        source_type: row.fields.source_type.to_u16(),
+        confidence: row.fields.confidence,
+        witnessing_depth: row.fields.witnessing_depth.to_u8(),
+        attestor_relationship: row.fields.attestor_relationship.to_u8(),
+        provenance_origin: row.provenance_origin,
         signer_asserted_at: row.fields.signer_asserted_at,
         notarized_at: row.notarized_at,
         retention_hint: row.fields.retention_hint,

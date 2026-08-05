@@ -102,7 +102,48 @@ fi
 echo "  ok"
 
 echo
-echo "=== 12. tampered attestation offline verify should fail"
+echo "=== 12a. attest with full provenance (ORCID shape)"
+# SHA-256 of a canonicalized ORCID identifier per SPEC §9.2 source_type=2.
+ORCID_HASH_B64="$(printf '0000-0002-1825-0097' | shasum -a 256 | cut -d' ' -f1 | \
+  python3 -c 'import sys,base64,binascii;print(base64.b64encode(binascii.unhexlify(sys.stdin.read().strip())).decode())')"
+echo '{"paper":"10.1234/example","note":"ORCID-anchored"}' > "$TMPDIR/orcid.json"
+CLI attest \
+  --key "$TMPDIR/my.key" \
+  --subject "sha256:$(shasum -a 256 "$TMPDIR/orcid.json" | cut -d' ' -f1)" \
+  --activity-type "credit.niso.org/contributor-roles/data-curation" \
+  --payload "$TMPDIR/orcid.json" \
+  --source-type 2 \
+  --source-hash "$ORCID_HASH_B64" \
+  --confidence 9500 \
+  --witnessing-depth 4 \
+  --attestor-relationship 1 \
+  --out "$TMPDIR/orcid-attest.json"
+echo "  ok"
+
+echo
+echo "=== 12b. offline verify of ORCID-shape attestation"
+CLI verify "$TMPDIR/orcid-attest.json"
+
+echo
+echo "=== 12c. server should reject invalid confidence"
+INVALID_ATTEST=$(CLI attest \
+  --key "$TMPDIR/my.key" \
+  --subject "$SUBJECT_HASH" \
+  --activity-type "sworn.dev/v1/endorsement" \
+  --payload "$TMPDIR/hello.json" \
+  --confidence 15000 2>&1) || echo "  ok (client rejected: $(echo "$INVALID_ATTEST" | tail -1 | head -c 60)...)"
+
+echo
+echo "=== 12d. server should reject unknown source_type"
+INVALID_ATTEST=$(CLI attest \
+  --key "$TMPDIR/my.key" \
+  --subject "$SUBJECT_HASH" \
+  --activity-type "sworn.dev/v1/endorsement" \
+  --payload "$TMPDIR/hello.json" \
+  --source-type 99 2>&1) || echo "  ok (client rejected: $(echo "$INVALID_ATTEST" | tail -1 | head -c 60)...)"
+
+echo
+echo "=== 13. tampered attestation offline verify should fail"
 python3 -c "
 import json, sys
 with open('$TMPDIR/attestation.json') as f: r = json.load(f)

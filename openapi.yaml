@@ -311,7 +311,24 @@ components:
 
     CreateAttestationRequest:
       type: object
-      required: [signer_pubkey, subject, activity_type_uri, signer_asserted_at, retention_hint, nonce, signature, payload]
+      description: >
+        v0.1-final attestation submission. All fields carrying provenance
+        (source_hash, source_type, confidence, witnessing_depth,
+        attestor_relationship) are required and covered by the signature.
+      required:
+        - signer_pubkey
+        - subject
+        - activity_type_uri
+        - source_hash
+        - source_type
+        - confidence
+        - witnessing_depth
+        - attestor_relationship
+        - signer_asserted_at
+        - retention_hint
+        - nonce
+        - signature
+        - payload
       properties:
         signer_pubkey:
           type: string
@@ -326,10 +343,50 @@ components:
           type: string
           nullable: true
           description: 32 bytes, base64. Omit or send "" for none.
+        source_hash:
+          type: string
+          description: >
+            32 bytes, base64. SHA-256 of the canonical source identifier per
+            SPEC §9.2. MUST be all-zero when source_type is 0 (unknown) or
+            1 (self_reported).
+        source_type:
+          type: integer
+          minimum: 0
+          maximum: 14
+          description: >
+            Registered value from SPEC §9.2. 0=unknown, 1=self_reported,
+            2=orcid, 3=doi, 4=openalex, 5=git_commit, 6=rss_parsed,
+            7=open_source_project, 8=coordinator_confirmed,
+            9=peer_witnessed, 10=computed, 11=system_observed,
+            12=regulatory_filing, 13=community_curated_db,
+            14=external_sworn_attestation.
+        confidence:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: >
+            Signer's confidence in basis points, 0-10000. Snapshot at
+            signing time; not revisable in place (SPEC §2.5).
+        witnessing_depth:
+          type: integer
+          minimum: 0
+          maximum: 5
+          description: >
+            Registered value from SPEC §9.3. 0=unspecified,
+            1=physically_observed, 2=reviewed_artifacts, 3=ui_confirmed,
+            4=computed_match, 5=self_asserted.
+        attestor_relationship:
+          type: integer
+          minimum: 0
+          maximum: 6
+          description: >
+            Registered value from SPEC §9.4. 0=unknown, 1=self,
+            2=coordinator, 3=peer, 4=mentor, 5=unaffiliated,
+            6=institution.
         signer_asserted_at:
           type: integer
           format: int64
-          description: Signer's self-claimed unix seconds. Informational only.
+          description: Signer's self-claimed unix seconds. Informational only per SPEC §2.5.1.
         retention_hint:
           type: integer
           format: int64
@@ -339,7 +396,9 @@ components:
           description: 32 bytes, base64. Fresh per attestation.
         signature:
           type: string
-          description: 64 bytes, base64. Ed25519 over canonical bytes.
+          description: >
+            64 bytes, base64. Ed25519 PureEdDSA over the 248-byte v0.1-final
+            canonical byte sequence (SPEC §3.1).
         payload:
           description: |
             The full JSON payload. `SHA-256(RFC-8785(payload))` MUST equal
@@ -347,15 +406,18 @@ components:
 
     CreateAttestationResponse:
       type: object
-      required: [id, notarized_at, data_hash, activity_hash]
+      required: [id, notarized_at, data_hash, activity_hash, spec_version]
       properties:
         id:
           type: string
           format: uuid
+        spec_version:
+          type: integer
+          description: Always 2 (v0.1-final) for new attestations.
         notarized_at:
           type: integer
           format: int64
-          description: Server clock unix seconds. Trust-relevant per OPEN_QUESTIONS Q2.
+          description: Server clock unix seconds. Trust-relevant per SPEC §2.5.1.
         data_hash:
           type: string
           description: 32 bytes, base64.
@@ -365,14 +427,24 @@ components:
 
     AttestationView:
       type: object
+      description: >
+        Metadata view of a stored attestation. Does NOT include the payload;
+        payload retrieval requires a disclosure token (see /disclose).
       required:
         - id
+        - spec_version
         - signer_pubkey
         - subject
         - activity_type_uri
         - activity_hash
         - data_hash
         - witness_for
+        - source_hash
+        - source_type
+        - confidence
+        - witnessing_depth
+        - attestor_relationship
+        - provenance_origin
         - signer_asserted_at
         - notarized_at
         - retention_hint
@@ -380,12 +452,26 @@ components:
         - signature
       properties:
         id: { type: string, format: uuid }
+        spec_version: { type: integer, description: '1 = v0.1-preview (deprecated), 2 = v0.1-final.' }
         signer_pubkey: { type: string }
         subject: { type: string }
         activity_type_uri: { type: string }
         activity_hash: { type: string }
         data_hash: { type: string }
         witness_for: { type: string, description: 'Zeros when unused.' }
+        source_hash: { type: string, description: 'Zeros when source_type is Unknown or SelfReported.' }
+        source_type: { type: integer, minimum: 0, maximum: 14 }
+        confidence: { type: integer, minimum: 0, maximum: 10000 }
+        witnessing_depth: { type: integer, minimum: 0, maximum: 5 }
+        attestor_relationship: { type: integer, minimum: 0, maximum: 6 }
+        provenance_origin:
+          type: string
+          enum: [original, backfilled]
+          description: >
+            'original' if provenance was signed by the original signer at
+            signing time (covered by the signature); 'backfilled' if
+            provenance was reconstructed during migration and is NOT covered
+            by the signature. See IMPLEMENTATION_NOTES.md.
         signer_asserted_at: { type: integer, format: int64 }
         notarized_at: { type: integer, format: int64 }
         retention_hint: { type: integer, format: int64 }

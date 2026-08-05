@@ -8,7 +8,9 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
-use sworn_verify::AttestationFields;
+use sworn_verify::{
+    AttestationFields, AttestorRelationship, SourceType, WitnessingDepth,
+};
 use uuid::Uuid;
 
 pub use sqlx::Error as SqlxError;
@@ -26,17 +28,29 @@ pub enum StoreError {
 }
 
 /// Full stored form of an attestation. Everything a verifier needs, plus
-/// housekeeping (id, notarized_at). The payload lives in a separate column
-/// so /disclose can return it without hydrating the full record.
+/// housekeeping (id, notarized_at, spec_version, provenance_origin).
+///
+/// `fields` carries v0.1-final canonical attestation content including
+/// provenance. `provenance_origin` distinguishes 'original' (provenance
+/// produced by the signer at signing time and covered by the signature)
+/// from 'backfilled' (provenance reconstructed during migration and NOT
+/// covered by the signature). See IMPLEMENTATION_NOTES.md.
 #[derive(Debug, Clone)]
 pub struct StoredAttestation {
     pub id: Uuid,
     pub fields: AttestationFields,
     pub signature: [u8; 64],
     pub activity_type_uri: String,
-    /// Server-clock timestamp of insertion. This is the trust-relevant timestamp
-    /// per OPEN_QUESTIONS Q2. `fields.signer_asserted_at` is informational only.
+    /// Server-clock timestamp of insertion. Trust-relevant per SPEC §2.5.1.
+    /// `fields.signer_asserted_at` is informational only.
     pub notarized_at: i64,
+    /// spec_version marker per SPEC §3.1.1. 1 = v0.1-preview (deprecated,
+    /// signature does NOT cover provenance fields), 2 = v0.1-final.
+    pub spec_version: i16,
+    /// 'original' if provenance was signed by the original signer at
+    /// signing time; 'backfilled' if provenance was reconstructed during
+    /// migration and is not covered by the signature.
+    pub provenance_origin: String,
 }
 
 /// Open a pool. Callers are expected to set connect params via `DATABASE_URL`.
@@ -72,13 +86,19 @@ pub async fn insert_attestation(
 ) -> Result<(Uuid, i64), StoreError> {
     let notarized_at = chrono::Utc::now().timestamp();
 
+    // All v0.1-final inserts go with spec_version = 2 and
+    // provenance_origin = 'original'. Backfill of v0.1-preview rows uses
+    // separate paths (not exposed at this API surface).
     let insert = sqlx::query(
         r#"
         INSERT INTO attestations
             (signer_pubkey, subject, activity_type_uri, activity_hash,
              data_hash, witness_for, signer_asserted_at, notarized_at,
-             retention_hint, nonce, signature, payload)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             retention_hint, nonce, signature, payload,
+             spec_version, source_hash, source_type, confidence,
+             witnessing_depth, attestor_relationship, provenance_origin)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                2, $13, $14, $15, $16, $17, 'original')
         RETURNING id
         "#,
     )
@@ -94,6 +114,11 @@ pub async fn insert_attestation(
     .bind(&fields.nonce[..])
     .bind(&signature[..])
     .bind(payload_json)
+    .bind(&fields.source_hash[..])
+    .bind(fields.source_type.to_u16() as i16)
+    .bind(fields.confidence as i16)
+    .bind(fields.witnessing_depth.to_u8() as i16)
+    .bind(fields.attestor_relationship.to_u8() as i16)
     .fetch_one(pool)
     .await;
 
@@ -121,13 +146,22 @@ pub async fn insert_attestation(
 }
 
 /// Fetch metadata for a single attestation by id. Does NOT return the payload
-/// (that path goes through /disclose in CP3+).
+/// (that path goes through /disclose).
+///
+/// Returns provenance fields as first-class content of `fields` per v0.1-final.
+/// If the row is a legacy v0.1-preview row (spec_version = 1), the provenance
+/// fields carry migration defaults (SelfReported, Unknown, Unspecified, 0
+/// confidence, zero source_hash) and are NOT covered by the historical
+/// signature; `provenance_origin` will read 'backfilled' for such rows once
+/// the backfill job runs, or `original` for freshly-signed v0.1-final rows.
 pub async fn get_attestation(pool: &PgPool, id: Uuid) -> Result<Option<StoredAttestation>, StoreError> {
     let row = sqlx::query(
         r#"
         SELECT id, signer_pubkey, subject, activity_type_uri, activity_hash,
                data_hash, witness_for, signer_asserted_at, notarized_at,
-               retention_hint, nonce, signature
+               retention_hint, nonce, signature,
+               spec_version, source_hash, source_type, confidence,
+               witnessing_depth, attestor_relationship, provenance_origin
         FROM attestations
         WHERE id = $1
         "#,
@@ -145,6 +179,30 @@ pub async fn get_attestation(pool: &PgPool, id: Uuid) -> Result<Option<StoredAtt
     let witness_for: Vec<u8> = row.get("witness_for");
     let nonce: Vec<u8> = row.get("nonce");
     let signature: Vec<u8> = row.get("signature");
+    let source_hash: Vec<u8> = row.get("source_hash");
+
+    let source_type_i16: i16 = row.get("source_type");
+    let confidence_i16: i16 = row.get("confidence");
+    let witnessing_depth_i16: i16 = row.get("witnessing_depth");
+    let attestor_relationship_i16: i16 = row.get("attestor_relationship");
+
+    let source_type = SourceType::from_u16(source_type_i16 as u16).ok_or_else(|| {
+        StoreError::Sqlx(sqlx::Error::Decode(
+            format!("unknown source_type {}", source_type_i16).into(),
+        ))
+    })?;
+    let witnessing_depth = WitnessingDepth::from_u8(witnessing_depth_i16 as u8)
+        .ok_or_else(|| {
+            StoreError::Sqlx(sqlx::Error::Decode(
+                format!("unknown witnessing_depth {}", witnessing_depth_i16).into(),
+            ))
+        })?;
+    let attestor_relationship = AttestorRelationship::from_u8(attestor_relationship_i16 as u8)
+        .ok_or_else(|| {
+            StoreError::Sqlx(sqlx::Error::Decode(
+                format!("unknown attestor_relationship {}", attestor_relationship_i16).into(),
+            ))
+        })?;
 
     let fields = AttestationFields {
         signer: to_32(&signer)?,
@@ -152,6 +210,11 @@ pub async fn get_attestation(pool: &PgPool, id: Uuid) -> Result<Option<StoredAtt
         activity_hash: to_32(&activity_hash)?,
         data_hash: to_32(&data_hash)?,
         witness_for: to_32(&witness_for)?,
+        source_hash: to_32(&source_hash)?,
+        source_type,
+        confidence: confidence_i16 as u16,
+        witnessing_depth,
+        attestor_relationship,
         signer_asserted_at: row.get::<i64, _>("signer_asserted_at"),
         retention_hint: row.get::<i64, _>("retention_hint"),
         nonce: to_32(&nonce)?,
@@ -163,6 +226,8 @@ pub async fn get_attestation(pool: &PgPool, id: Uuid) -> Result<Option<StoredAtt
         signature: to_64(&signature)?,
         activity_type_uri: row.get("activity_type_uri"),
         notarized_at: row.get("notarized_at"),
+        spec_version: row.get("spec_version"),
+        provenance_origin: row.get("provenance_origin"),
     }))
 }
 

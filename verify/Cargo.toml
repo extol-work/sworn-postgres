@@ -16,3 +16,7 @@ ed25519-dalek.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# For emitting reference test vectors as JSON (see examples/emit_vectors.rs).
+serde_json.workspace = true

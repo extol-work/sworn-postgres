@@ -38,7 +38,7 @@ struct Cli {
 enum Cmd {
     /// Generate an Ed25519 signing key. Prints an encoded key to stdout.
     Keygen,
-    /// Sign a payload and submit an attestation to the API.
+    /// Sign a payload and submit a v0.1-final attestation to the API.
     Attest {
         /// Path to a keyfile produced by `sworn keygen`.
         #[arg(long)]
@@ -59,6 +59,23 @@ enum Cmd {
         /// Retention hint in seconds; -1 for permanent (default).
         #[arg(long, default_value_t = -1)]
         retention_hint: i64,
+        /// Source type from SPEC §9.2 registry. Default: 1 (self_reported).
+        /// See SPEC for the full enum.
+        #[arg(long, default_value_t = 1u16)]
+        source_type: u16,
+        /// Base64 source_hash (32 bytes). Empty defaults to 32 zero bytes.
+        /// MUST be 32 zero bytes when source_type is 0 (unknown) or 1 (self_reported).
+        #[arg(long, default_value = "")]
+        source_hash: String,
+        /// Confidence in basis points, 0-10000. Default 10000 (maximum).
+        #[arg(long, default_value_t = 10_000u16)]
+        confidence: u16,
+        /// Witnessing depth per SPEC §9.3. Default 5 (self_asserted).
+        #[arg(long, default_value_t = 5u8)]
+        witnessing_depth: u8,
+        /// Attestor relationship per SPEC §9.4. Default 1 (self).
+        #[arg(long, default_value_t = 1u8)]
+        attestor_relationship: u8,
         /// Save the created attestation record locally as JSON. Off by default.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -102,6 +119,11 @@ struct CreateReq<'a> {
     activity_type_uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     witness_for: Option<String>,
+    source_hash: String,
+    source_type: u16,
+    confidence: u16,
+    witnessing_depth: u8,
+    attestor_relationship: u8,
     signer_asserted_at: i64,
     retention_hint: i64,
     nonce: String,
@@ -115,6 +137,8 @@ struct CreateResp {
     notarized_at: i64,
     data_hash: String,
     activity_hash: String,
+    #[serde(default)]
+    spec_version: i16,
 }
 
 #[derive(Deserialize)]
@@ -132,16 +156,23 @@ struct VerifyResp {
     attestation_id: uuid::Uuid,
 }
 
-/// Local record we save with --out. Includes enough to re-verify offline.
+/// Local record we save with --out. Includes enough to re-verify offline
+/// (v0.1-final layout).
 #[derive(Serialize, Deserialize)]
 struct LocalRecord {
     id: uuid::Uuid,
+    spec_version: i16,
     signer_pubkey: String,
     subject: String,
     activity_type_uri: String,
     activity_hash: String,
     data_hash: String,
     witness_for: String,
+    source_hash: String,
+    source_type: u16,
+    confidence: u16,
+    witnessing_depth: u8,
+    attestor_relationship: u8,
     signer_asserted_at: i64,
     notarized_at: i64,
     retention_hint: i64,
@@ -164,18 +195,28 @@ async fn main() -> Result<()> {
             payload,
             witness_for,
             retention_hint,
+            source_type,
+            source_hash,
+            confidence,
+            witnessing_depth,
+            attestor_relationship,
             out,
         } => {
-            cmd_attest(
-                &cli.api_url,
-                &key,
-                &subject,
-                &activity_type,
-                &payload,
-                witness_for.as_deref(),
+            cmd_attest(AttestArgs {
+                api_url: &cli.api_url,
+                keyfile: &key,
+                subject: &subject,
+                activity_type_uri: &activity_type,
+                payload_arg: &payload,
+                witness_for: witness_for.as_deref(),
                 retention_hint,
-                out.as_deref(),
-            )
+                source_type,
+                source_hash: &source_hash,
+                confidence,
+                witnessing_depth,
+                attestor_relationship,
+                out: out.as_deref(),
+            })
             .await
         }
         Cmd::Verify { target } => cmd_verify(&cli.api_url, &target).await,
@@ -207,42 +248,72 @@ fn cmd_keygen() -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn cmd_attest(
-    api_url: &str,
-    keyfile: &std::path::Path,
-    subject: &str,
-    activity_type_uri: &str,
-    payload_arg: &str,
-    witness_for: Option<&str>,
+struct AttestArgs<'a> {
+    api_url: &'a str,
+    keyfile: &'a std::path::Path,
+    subject: &'a str,
+    activity_type_uri: &'a str,
+    payload_arg: &'a str,
+    witness_for: Option<&'a str>,
     retention_hint: i64,
-    out: Option<&std::path::Path>,
-) -> Result<()> {
+    source_type: u16,
+    source_hash: &'a str,
+    confidence: u16,
+    witnessing_depth: u8,
+    attestor_relationship: u8,
+    out: Option<&'a std::path::Path>,
+}
+
+async fn cmd_attest(args: AttestArgs<'_>) -> Result<()> {
     // 1. Load key.
-    let (signing_key, pk_bytes) = load_key(keyfile)?;
+    let (signing_key, pk_bytes) = load_key(args.keyfile)?;
 
     // 2. Resolve subject to 32 bytes.
-    let subject_bytes = resolve_subject(subject)?;
+    let subject_bytes = resolve_subject(args.subject)?;
 
     // 3. Load payload JSON.
-    let payload_val = load_payload(payload_arg)?;
+    let payload_val = load_payload(args.payload_arg)?;
 
     // 4. Compute activity_hash and data_hash exactly as the server will.
-    let activity_hash: [u8; 32] = Sha256::digest(activity_type_uri.as_bytes()).into();
+    let activity_hash: [u8; 32] = Sha256::digest(args.activity_type_uri.as_bytes()).into();
     let canonical = serde_jcs::to_vec(&payload_val).context("JCS-canonicalize payload")?;
     let data_hash: [u8; 32] = Sha256::digest(&canonical).into();
 
-    // 5. Random nonce (CP2). Deterministic derivation per §3.4 is a future add.
+    // 5. Random nonce. Deterministic derivation per SPEC §3.4 is a future add.
     let mut nonce = [0u8; 32];
     OsRng.fill_bytes(&mut nonce);
 
     // 6. Witness_for: zeros unless caller provided one.
-    let witness_for_bytes = match witness_for {
+    let witness_for_bytes = match args.witness_for {
         None | Some("") => [0u8; 32],
         Some(s) => b64_32(s).context("--witness-for")?,
     };
 
-    // 7. Signer-asserted timestamp: local clock at signing time. Informational only.
+    // 7. Provenance fields per SPEC §2.5 (v0.1-final).
+    let source_type_enum = sworn_verify::SourceType::from_u16(args.source_type)
+        .ok_or_else(|| anyhow!("unknown --source-type {}; see SPEC §9.2", args.source_type))?;
+    let witnessing_depth_enum =
+        sworn_verify::WitnessingDepth::from_u8(args.witnessing_depth).ok_or_else(|| {
+            anyhow!("unknown --witnessing-depth {}; see SPEC §9.3", args.witnessing_depth)
+        })?;
+    let attestor_relationship_enum =
+        sworn_verify::AttestorRelationship::from_u8(args.attestor_relationship)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown --attestor-relationship {}; see SPEC §9.4",
+                    args.attestor_relationship
+                )
+            })?;
+    if args.confidence > 10_000 {
+        bail!("--confidence {} exceeds 10000 basis-points ceiling", args.confidence);
+    }
+    let source_hash_bytes: [u8; 32] = if args.source_hash.is_empty() {
+        [0u8; 32]
+    } else {
+        b64_32(args.source_hash).context("--source-hash")?
+    };
+
+    // 8. Signer-asserted timestamp: local clock at signing time. Informational only.
     let signer_asserted_at = chrono_now_secs();
 
     let fields = AttestationFields {
@@ -251,35 +322,45 @@ async fn cmd_attest(
         activity_hash,
         data_hash,
         witness_for: witness_for_bytes,
+        source_hash: source_hash_bytes,
+        source_type: source_type_enum,
+        confidence: args.confidence,
+        witnessing_depth: witnessing_depth_enum,
+        attestor_relationship: attestor_relationship_enum,
         signer_asserted_at,
-        retention_hint,
+        retention_hint: args.retention_hint,
         nonce,
     };
 
-    // 8. Sign.
+    // 9. Sign.
     let signature = sign(&signing_key, &fields).map_err(|e| anyhow!("sign: {}", e))?;
 
-    // 9. Local sanity check before we ship it: verify our own signature.
+    // 10. Local sanity check before we ship it: verify our own signature.
     verify(&fields, &signature).map_err(|e| anyhow!("self-verify failed (client bug): {}", e))?;
 
-    // 10. POST /attestations.
+    // 11. POST /attestations.
     let req = CreateReq {
         signer_pubkey: B64.encode(pk_bytes),
         subject: B64.encode(subject_bytes),
-        activity_type_uri: activity_type_uri.to_string(),
+        activity_type_uri: args.activity_type_uri.to_string(),
         witness_for: if witness_for_bytes == [0u8; 32] {
             None
         } else {
             Some(B64.encode(witness_for_bytes))
         },
+        source_hash: B64.encode(source_hash_bytes),
+        source_type: args.source_type,
+        confidence: args.confidence,
+        witnessing_depth: args.witnessing_depth,
+        attestor_relationship: args.attestor_relationship,
         signer_asserted_at,
-        retention_hint,
+        retention_hint: args.retention_hint,
         nonce: B64.encode(nonce),
         signature: B64.encode(signature),
         payload: &payload_val,
     };
 
-    let url = format!("{}/attestations", api_url.trim_end_matches('/'));
+    let url = format!("{}/attestations", args.api_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(&req).send().await?;
     let status = resp.status();
@@ -289,22 +370,29 @@ async fn cmd_attest(
         let ok: CreateResp = serde_json::from_str(&body_text)
             .with_context(|| format!("parse response: {}", body_text))?;
         println!("id:                {}", ok.id);
+        println!("spec_version:      {}", ok.spec_version);
         println!("notarized_at:      {}", ok.notarized_at);
         println!("data_hash (b64):   {}", ok.data_hash);
         println!("activity_hash (b64): {}", ok.activity_hash);
 
-        if let Some(path) = out {
+        if let Some(path) = args.out {
             let record = LocalRecord {
                 id: ok.id,
+                spec_version: ok.spec_version,
                 signer_pubkey: B64.encode(pk_bytes),
                 subject: B64.encode(subject_bytes),
-                activity_type_uri: activity_type_uri.to_string(),
+                activity_type_uri: args.activity_type_uri.to_string(),
                 activity_hash: B64.encode(activity_hash),
                 data_hash: B64.encode(data_hash),
                 witness_for: B64.encode(witness_for_bytes),
+                source_hash: B64.encode(source_hash_bytes),
+                source_type: args.source_type,
+                confidence: args.confidence,
+                witnessing_depth: args.witnessing_depth,
+                attestor_relationship: args.attestor_relationship,
                 signer_asserted_at,
                 notarized_at: ok.notarized_at,
-                retention_hint,
+                retention_hint: args.retention_hint,
                 nonce: B64.encode(nonce),
                 signature: B64.encode(signature),
                 payload: payload_val,
@@ -351,12 +439,30 @@ async fn cmd_verify(api_url: &str, target: &str) -> Result<()> {
             .with_context(|| format!("read record file: {}", target))?;
         let record: LocalRecord = serde_json::from_slice(&record_bytes)?;
 
+        let source_type = sworn_verify::SourceType::from_u16(record.source_type)
+            .ok_or_else(|| anyhow!("record has unknown source_type {}", record.source_type))?;
+        let witnessing_depth = sworn_verify::WitnessingDepth::from_u8(record.witnessing_depth)
+            .ok_or_else(|| {
+                anyhow!("record has unknown witnessing_depth {}", record.witnessing_depth)
+            })?;
+        let attestor_relationship =
+            sworn_verify::AttestorRelationship::from_u8(record.attestor_relationship).ok_or_else(
+                || anyhow!(
+                    "record has unknown attestor_relationship {}",
+                    record.attestor_relationship
+                ),
+            )?;
         let fields = AttestationFields {
             signer: b64_32(&record.signer_pubkey)?,
             subject: b64_32(&record.subject)?,
             activity_hash: b64_32(&record.activity_hash)?,
             data_hash: b64_32(&record.data_hash)?,
             witness_for: b64_32(&record.witness_for)?,
+            source_hash: b64_32(&record.source_hash)?,
+            source_type,
+            confidence: record.confidence,
+            witnessing_depth,
+            attestor_relationship,
             signer_asserted_at: record.signer_asserted_at,
             retention_hint: record.retention_hint,
             nonce: b64_32(&record.nonce)?,
