@@ -421,6 +421,17 @@ pub fn sign(
 ///   * that the external source referenced by `source_hash` is reachable or
 ///     authoritative (§2.5.1: signer's claim, not verifier's guarantee).
 pub fn verify(fields: &AttestationFields, signature: &[u8]) -> Result<(), VerifyError> {
+    // Provenance well-formedness (§2.4): verifiers MUST reject malformed-at-
+    // Layer-1 attestations independently of signature validity. Enforced
+    // here BEFORE the Ed25519 check so callers get a semantic error
+    // (`NonZeroSourceHashForSourceless`) rather than an opaque signature-
+    // mismatch when the caller signed spec-violating canonical bytes.
+    if fields.source_type.requires_zero_source_hash()
+        && fields.source_hash != [0u8; HASH_LEN]
+    {
+        return Err(VerifyError::NonZeroSourceHashForSourceless(fields.source_type));
+    }
+
     if signature.len() != SIGNATURE_LENGTH {
         return Err(VerifyError::BadSignatureLen(signature.len()));
     }
