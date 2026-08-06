@@ -3,7 +3,7 @@
 # Not optimized for cache reuse yet; will iterate in a later CP if needed.
 # Everything is built from source inside the image for reproducibility.
 
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.94-slim-bookworm AS builder
 
 WORKDIR /src
 
